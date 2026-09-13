@@ -628,13 +628,37 @@
                     console.warn("[PrivCloud] No active session found for client-side reauthenticate; backend triggers automatically.");
                     return { data: null, error: { message: "No active session for reauthentication" } };
                 }
-                const res = await client.auth.reauthenticate();
-                if (res && res.error) {
-                    console.warn("[PrivCloud] Supabase reauthenticate notice:", res.error.message);
-                } else {
-                    console.log("[PrivCloud] Reauthentication email triggered successfully via Supabase client.");
+
+                // 1. Try official client.auth.reauthenticate()
+                if (client.auth && typeof client.auth.reauthenticate === 'function') {
+                    try {
+                        const res = await client.auth.reauthenticate();
+                        if (!res || !res.error) {
+                            console.log("[PrivCloud] Reauthentication email triggered successfully via Supabase client.");
+                            return res || { data: {}, error: null };
+                        }
+                    } catch (cliErr) {
+                        console.warn("[PrivCloud] client.auth.reauthenticate notice:", cliErr);
+                    }
                 }
-                return res || { data: {}, error: null };
+
+                // 2. Direct Supabase Auth reauthenticate fallback with Bearer token
+                const reauthUrl = `${SUPABASE_URL.replace(/\/+$/, '')}/auth/v1/reauthenticate`;
+                const resp = await fetch(reauthUrl, {
+                    method: 'GET',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${session.access_token}`
+                    }
+                });
+                if (resp.ok) {
+                    console.log("[PrivCloud] Reauthentication email triggered successfully via direct Supabase auth endpoint.");
+                    return { data: {}, error: null };
+                } else {
+                    const errText = await resp.text();
+                    console.warn("[PrivCloud] Direct reauthenticate notice:", resp.status, errText);
+                    return { data: null, error: { message: errText } };
+                }
             } catch (err) {
                 console.warn("[PrivCloud] Supabase reauthenticate exception:", err);
                 return { data: null, error: err };

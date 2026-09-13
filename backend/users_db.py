@@ -637,18 +637,48 @@ async def trigger_supabase_invite_async(email: str) -> bool:
 
     target_email = email.strip().lower()
     try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
+        async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post(
                 f"{SUPABASE_URL.rstrip('/')}/auth/v1/invite",
                 headers=get_supabase_headers(),
                 json={"email": target_email}
             )
             if resp.status_code in (200, 201):
+                print(f"[PrivCloud Auth] Supabase invite email ('Your Privcloud Password was changed') dispatched to {target_email}.")
                 return True
-    except Exception:
-        pass
+            else:
+                print(f"[PrivCloud Auth] Supabase invite notice for {target_email}: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print(f"[PrivCloud Auth] Exception dispatching Supabase invite for {target_email}: {e}")
 
     _dispatch_password_change_notice(target_email)
+    return False
+
+
+async def trigger_supabase_account_ready(email: str, username: Optional[str] = None) -> bool:
+    """
+    Trigger Supabase 'Magic link or OTP' email template:
+    'Welcome to PrivCloud — Your Account Is Ready!'
+    Called when a user finishes signup OTP verification and their account is ready.
+    """
+    if not SUPABASE_URL or not ACTIVE_SUPABASE_KEY or not email:
+        return False
+
+    clean_email = email.strip().lower()
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL.rstrip('/')}/auth/v1/otp",
+                headers=get_supabase_headers(),
+                json={"email": clean_email, "create_user": False}
+            )
+            if resp.status_code in (200, 204):
+                print(f"[PrivCloud Supabase] Account ready email ('Welcome to PrivCloud — Your Account Is Ready!') dispatched to {clean_email}.")
+                return True
+            else:
+                print(f"[PrivCloud Supabase] Account ready email notice for {clean_email}: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print(f"[PrivCloud Supabase] Exception dispatching account ready email: {e}")
     return False
 
 
@@ -689,21 +719,110 @@ def _dispatch_password_change_notice(email: str) -> None:
             pass
 
 
-def trigger_supabase_reauthentication(email: str, payment_details: Optional[Dict[str, Any]] = None) -> bool:
-    """Dispatch official payment confirmation and license receipt to the customer via direct mailer."""
+def trigger_supabase_reauthentication(
+    email: str,
+    payment_details: Optional[Dict[str, Any]] = None,
+    bearer_token: Optional[str] = None
+) -> bool:
+    """
+    Dispatch official payment confirmation email to the customer using Supabase Auth
+    Reauthentication email template: 'PrivCloud Payment Confirmation — {{ .TransactionID }}'.
+    Populates dynamic template variables including {{ .TransactionID }} in Supabase Auth user_metadata.
+    """
     if not email:
         return False
 
-    target_email = email.strip().lower()
+    clean_email = email.strip().lower()
+    tx_id = "CONFIRMED"
+    if payment_details:
+        tx_id = str(payment_details.get("TransactionID") or payment_details.get("transaction_id") or "CONFIRMED").strip()
+
+    # 1. Update user_metadata in Supabase Auth with TransactionID so {{ .TransactionID }} is rendered
+    if SUPABASE_URL and ACTIVE_SUPABASE_KEY:
+        try:
+            headers = get_supabase_headers()
+            with httpx.Client(timeout=10.0) as client:
+                admin_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users"
+                r_users = client.get(admin_url, headers=headers)
+                if r_users.status_code == 200:
+                    data = r_users.json()
+                    users_list = data.get("users", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    target_user = None
+                    for u in users_list:
+                        if (u.get("email") or "").strip().lower() == clean_email:
+                            target_user = u
+                            break
+
+                    if target_user:
+                        user_id = target_user.get("id")
+                        existing_meta = dict(target_user.get("user_metadata") or {})
+                        
+                        # Populate template dynamic variables
+                        existing_meta["TransactionID"] = tx_id
+                        existing_meta["transaction_id"] = tx_id
+                        if payment_details:
+                            for k, v in payment_details.items():
+                                if v is not None:
+                                    existing_meta[k] = v
+
+                        # Update user_metadata
+                        client.put(
+                            f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}",
+                            headers=headers,
+                            json={"user_metadata": existing_meta}
+                        )
+        except Exception as meta_err:
+            print(f"[PrivCloud Supabase] Notice updating metadata for reauthentication: {meta_err}")
+
+    # 2. Trigger Supabase Reauthentication email via GET /auth/v1/reauthenticate
+    reauth_triggered = False
+    if SUPABASE_URL and ACTIVE_SUPABASE_KEY:
+        try:
+            token = bearer_token
+            # If no bearer_token supplied, generate a session token via admin generate_link & verify
+            if not token:
+                with httpx.Client(timeout=10.0) as client:
+                    gl_res = client.post(
+                        f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/generate_link",
+                        headers=get_supabase_headers(),
+                        json={"type": "magiclink", "email": clean_email}
+                    )
+                    if gl_res.status_code == 200:
+                        otp_code = gl_res.json().get("email_otp")
+                        if otp_code:
+                            vt_res = client.post(
+                                f"{SUPABASE_URL.rstrip('/')}/auth/v1/verify",
+                                headers={"apikey": SUPABASE_KEY or ACTIVE_SUPABASE_KEY},
+                                json={"type": "magiclink", "token": otp_code, "email": clean_email}
+                            )
+                            if vt_res.status_code == 200:
+                                token = vt_res.json().get("access_token")
+
+            if token:
+                with httpx.Client(timeout=25.0) as client:
+                    reauth_res = client.get(
+                        f"{SUPABASE_URL.rstrip('/')}/auth/v1/reauthenticate",
+                        headers={
+                            "apikey": SUPABASE_KEY or ACTIVE_SUPABASE_KEY,
+                            "Authorization": f"Bearer {token}"
+                        }
+                    )
+                    if reauth_res.status_code in (200, 204):
+                        print(f"[PrivCloud Supabase] Reauthentication email ('PrivCloud Payment Confirmation — {tx_id}') successfully triggered for {clean_email}.")
+                        reauth_triggered = True
+                    else:
+                        print(f"[PrivCloud Supabase] Reauthentication notice for {clean_email}: {reauth_res.status_code} - {reauth_res.text}")
+        except Exception as reauth_err:
+            print(f"[PrivCloud Supabase] Reauthentication dispatch exception for {clean_email}: {reauth_err}")
+
+    # 3. Direct receipt delivery fallback
     if payment_details:
         try:
-            dispatch_direct_payment_receipt(target_email, payment_details)
-            print(f"[PrivCloud Mailer] Payment receipt dispatched successfully to {target_email}.")
-            return True
-        except Exception as e:
-            print(f"[PrivCloud Mailer] Exception dispatching payment receipt: {e}")
-            return False
-    return False
+            dispatch_direct_payment_receipt(clean_email, payment_details)
+        except Exception:
+            pass
+
+    return reauth_triggered
 
 
 async def update_user_plan_tier(email: str, tier: str) -> bool:

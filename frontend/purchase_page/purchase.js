@@ -277,6 +277,18 @@ async function verifyAuthentication() {
     }
 
     if (window.PrivCloudAuth) {
+        // Setup listener for auth state changes (e.g. login or token refresh)
+        const client = window.PrivCloudAuth.getClient ? window.PrivCloudAuth.getClient() : window.supabaseClient;
+        if (client && client.auth && !window._authListenerAttached) {
+            window._authListenerAttached = true;
+            client.auth.onAuthStateChange(async (event, session) => {
+                if (session && session.user && (!currentUser || currentUser.id !== session.user.id)) {
+                    currentUser = session.user;
+                    await restoreVerifiedOrderSession();
+                }
+            });
+        }
+
         const session = await window.PrivCloudAuth.getSession();
         if (session && session.user) {
             currentUser = session.user;
@@ -1027,9 +1039,17 @@ async function handleUpgradeOrder(targetPlanId) {
                     const planTier = targetPlan.name.includes('Pro') ? 'PRO' : 'BASIC';
                     const userUname = meta.username || (userEmail ? userEmail.split('@')[0] : '');
 
+                    const headers = { 'Content-Type': 'application/json' };
+                    if (window.PrivCloudAuth && window.PrivCloudAuth.getSession) {
+                        const session = await window.PrivCloudAuth.getSession();
+                        if (session && session.access_token) {
+                            headers['Authorization'] = `Bearer ${session.access_token}`;
+                        }
+                    }
+
                     const verifyRes = await fetch(resolveApiUrl('/api/verify-payment'), {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: headers,
                         body: JSON.stringify({
                             razorpay_order_id: response.razorpay_order_id,
                             razorpay_payment_id: response.razorpay_payment_id,
@@ -1051,8 +1071,23 @@ async function handleUpgradeOrder(targetPlanId) {
 
                     if (verifyRes.ok && verifyData && verifyData.success) {
                         showFulfillmentAlert('success', `🎉 Upgrade successful! Welcome to ${targetPlan.name}!`);
+                        if (window.PrivCloudAuth && window.PrivCloudAuth.reauthenticate) {
+                            window.PrivCloudAuth.reauthenticate().catch(e => console.warn("[PrivCloud] Client reauth notice:", e));
+                        }
                         // Activate upgraded plan session and retrieve new product key
-                        onPaymentSuccess(targetPlan, response.razorpay_order_id, response.razorpay_payment_id, 0);
+                        onPaymentSuccess(
+                            targetPlan,
+                            response.razorpay_order_id,
+                            response.razorpay_payment_id,
+                            0,
+                            {
+                                key: verifyData.key || null,
+                                paymentStatus: 'verified',
+                                amount: targetPlan.amountNum,
+                                currency: 'INR',
+                                purchaseDate: new Date().toLocaleString()
+                            }
+                        );
                     } else {
                         showFulfillmentAlert('error', `❌ Payment verification failed: ${verifyData?.message || 'Signature mismatch.'} Your current active plan remains untouched.`);
                         if (upgradeBtn) {
@@ -1109,11 +1144,19 @@ async function handleOrderSubmission() {
             const userEmail = currentUser ? currentUser.email : '';
             let trialOrderId = `trial_${Date.now()}`;
             let trialPaymentId = 'FREE_TRIAL';
+            let trialKey = null;
 
             try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (window.PrivCloudAuth && window.PrivCloudAuth.getSession) {
+                    const session = await window.PrivCloudAuth.getSession();
+                    if (session && session.access_token) {
+                        headers['Authorization'] = `Bearer ${session.access_token}`;
+                    }
+                }
                 const trialRes = await fetch(resolveApiUrl('/api/create-trial-order'), {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: headers,
                     body: JSON.stringify({
                         plan_id: plan.id,
                         user_email: userEmail
@@ -1124,13 +1167,26 @@ async function handleOrderSubmission() {
                     if (trialData && trialData.order_id) {
                         trialOrderId = trialData.order_id;
                         trialPaymentId = trialData.payment_id || 'FREE_TRIAL';
+                        trialKey = trialData.key || null;
                     }
                 }
             } catch (apiErr) {
                 console.warn("[PrivCloud] /api/create-trial-order notice:", apiErr);
             }
 
-            onPaymentSuccess(plan, trialOrderId, trialPaymentId, 0);
+            onPaymentSuccess(
+                plan, 
+                trialOrderId, 
+                trialPaymentId, 
+                0, 
+                { 
+                    key: trialKey, 
+                    paymentStatus: 'verified', 
+                    amount: 0, 
+                    currency: 'INR',
+                    purchaseDate: new Date().toLocaleString()
+                }
+            );
         } catch (trialErr) {
             showPaymentNotice('error', `❌ ${trialErr.message}`);
         } finally {
@@ -1233,9 +1289,17 @@ async function handleOrderSubmission() {
                     const userUname = meta.username || (userEmail ? userEmail.split('@')[0] : '');
                     const planTier = plan.name.includes('Pro') ? 'PRO' : (plan.name.includes('Basic') ? 'BASIC' : 'TRIAL');
 
+                    const headers = { 'Content-Type': 'application/json' };
+                    if (window.PrivCloudAuth && window.PrivCloudAuth.getSession) {
+                        const session = await window.PrivCloudAuth.getSession();
+                        if (session && session.access_token) {
+                            headers['Authorization'] = `Bearer ${session.access_token}`;
+                        }
+                    }
+
                     const verifyRes = await fetch(resolveApiUrl('/api/verify-payment'), {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: headers,
                         body: JSON.stringify({
                             razorpay_order_id: response.razorpay_order_id,
                             razorpay_payment_id: response.razorpay_payment_id,
@@ -1259,7 +1323,22 @@ async function handleOrderSubmission() {
                         showPaymentNotice('success', isDonationOrder 
                             ? '✅ Thank you for your generous contribution!' 
                             : '✅ Payment verified successfully!');
-                        onPaymentSuccess(plan, response.razorpay_order_id, response.razorpay_payment_id, isDonationOrder ? chargeAmount : 0);
+                        if (window.PrivCloudAuth && window.PrivCloudAuth.reauthenticate) {
+                            window.PrivCloudAuth.reauthenticate().catch(e => console.warn("[PrivCloud] Client reauth notice:", e));
+                        }
+                        onPaymentSuccess(
+                            plan, 
+                            response.razorpay_order_id, 
+                            response.razorpay_payment_id, 
+                            isDonationOrder ? chargeAmount : 0,
+                            {
+                                key: verifyData.key || null,
+                                paymentStatus: 'verified',
+                                amount: isDonationOrder ? chargeAmount : plan.amountNum,
+                                currency: 'INR',
+                                purchaseDate: new Date().toLocaleString()
+                            }
+                        );
                     } else {
                         showPaymentNotice('error', `❌ Payment verification failed: ${verifyData.message || 'Signature mismatch.'}`);
                         submitBtn.disabled = false;
@@ -1294,11 +1373,15 @@ async function handleOrderSubmission() {
 /**
  * Handle successful payment / license activation
  */
-function onPaymentSuccess(plan, orderId, paymentId, donationAmount = 0) {
+function onPaymentSuccess(plan, orderId, paymentId, donationAmount = 0, extraData = {}) {
     const planTier = plan.name.includes('Pro') ? 'PRO' : (plan.name.includes('Basic') ? 'BASIC' : 'TRIAL');
     const userEmail = currentUser ? (currentUser.email || '').toLowerCase() : '';
     const userMeta = currentUser ? (currentUser.user_metadata || {}) : {};
     const userUname = userMeta.username || (userEmail ? userEmail.split('@')[0] : '');
+
+    const assignedKey = (extraData && extraData.key) || 
+                        (verifiedOrderSession && verifiedOrderSession.orderId === orderId && verifiedOrderSession.retrievedKey) || 
+                        null;
 
     // Save verified session strictly scoped to the user
     verifiedOrderSession = {
@@ -1309,7 +1392,11 @@ function onPaymentSuccess(plan, orderId, paymentId, donationAmount = 0) {
         plan: plan,
         tier: planTier,
         donationAmount: donationAmount,
-        retrievedKey: (verifiedOrderSession && verifiedOrderSession.orderId === orderId) ? verifiedOrderSession.retrievedKey : null
+        retrievedKey: assignedKey,
+        purchaseDate: (extraData && extraData.purchaseDate) || (verifiedOrderSession && verifiedOrderSession.purchaseDate) || new Date().toLocaleString(),
+        paymentStatus: (extraData && extraData.paymentStatus) || (verifiedOrderSession && verifiedOrderSession.paymentStatus) || 'verified',
+        amount: (extraData && (extraData.amount !== undefined)) ? extraData.amount : ((verifiedOrderSession && verifiedOrderSession.amount !== undefined) ? verifiedOrderSession.amount : (donationAmount > 0 ? donationAmount : plan.amountNum)),
+        currency: (extraData && extraData.currency) || (verifiedOrderSession && verifiedOrderSession.currency) || 'INR'
     };
 
     try {
@@ -1330,6 +1417,13 @@ function onPaymentSuccess(plan, orderId, paymentId, donationAmount = 0) {
     const metaOrderId = document.getElementById('meta-order-id');
     const metaPaymentId = document.getElementById('meta-payment-id');
     const metaPlanTier = document.getElementById('meta-plan-tier');
+    const metaDate = document.getElementById('meta-purchase-date');
+    const chipDate = document.getElementById('meta-chip-date');
+    const metaStatus = document.getElementById('meta-payment-status');
+    const chipStatus = document.getElementById('meta-chip-status');
+    const metaAmount = document.getElementById('meta-payment-amount');
+    const chipAmount = document.getElementById('meta-chip-amount');
+
     const vault = document.getElementById('product-key-vault');
     const keyBtn = document.getElementById('btn-get-product-key');
     const keyTitle = document.getElementById('btn-key-title');
@@ -1341,6 +1435,19 @@ function onPaymentSuccess(plan, orderId, paymentId, donationAmount = 0) {
     if (metaOrderId) metaOrderId.textContent = `#${orderId}`;
     if (metaPaymentId) metaPaymentId.textContent = `#${paymentId}`;
     if (metaPlanTier) metaPlanTier.textContent = planTier;
+
+    if (verifiedOrderSession.purchaseDate && metaDate && chipDate) {
+        metaDate.textContent = verifiedOrderSession.purchaseDate;
+        chipDate.style.display = 'inline-block';
+    }
+    if (verifiedOrderSession.paymentStatus && metaStatus && chipStatus) {
+        metaStatus.textContent = String(verifiedOrderSession.paymentStatus).toUpperCase();
+        chipStatus.style.display = 'inline-block';
+    }
+    if (verifiedOrderSession.amount !== undefined && metaAmount && chipAmount) {
+        metaAmount.textContent = verifiedOrderSession.amount > 0 ? `₹${verifiedOrderSession.amount}` : '₹0 (Free)';
+        chipAmount.style.display = 'inline-block';
+    }
 
     if (successTitle) {
         if (donationAmount > 0) {
@@ -1615,22 +1722,7 @@ async function restoreVerifiedOrderSession() {
     const userEmail = (currentUser.email || '').toLowerCase().trim();
     const userStorageKey = `pc_verified_order_${encodeURIComponent(userEmail)}`;
 
-    // 2. Check user-scoped sessionStorage
-    try {
-        const saved = sessionStorage.getItem(userStorageKey);
-        if (saved) {
-            const parsed = JSON.parse(saved);
-            if (parsed && parsed.orderId && parsed.plan && (parsed.userEmail || '').toLowerCase() === userEmail) {
-                verifiedOrderSession = parsed;
-                onPaymentSuccess(parsed.plan, parsed.orderId, parsed.paymentId, parsed.donationAmount || 0);
-                return;
-            }
-        }
-    } catch (e) {
-        console.warn("[PrivCloud] Session restore error:", e);
-    }
-
-    // 3. Fallback: Query backend for this specific user's active verified order in Supabase
+    // 2. Query backend database directly for this authenticated user's active verified order and product key
     try {
         const headers = {};
         if (window.PrivCloudAuth && window.PrivCloudAuth.getSession) {
@@ -1639,33 +1731,105 @@ async function restoreVerifiedOrderSession() {
                 headers['Authorization'] = `Bearer ${session.access_token}`;
             }
         }
-        const res = await fetch(resolveApiUrl(`/api/payment/my-license?user_email=${encodeURIComponent(userEmail)}`), { headers });
-        if (res.ok) {
-            const data = await res.json();
-            if (data && data.success && data.has_license && data.order_id) {
-                const tier = data.tier || 'TRIAL';
-                const planId = (tier === 'PRO') ? '6b2f8c1a9d4e07bf' : ((tier === 'BASIC') ? '4d9e1a7b0c3f8e2a' : '9a8f10e7b9c2d4a6');
-                const matchedPlan = PLANS_DATA[planId] || PLANS_DATA['9a8f10e7b9c2d4a6'];
 
-                verifiedOrderSession = {
-                    userEmail: userEmail,
-                    orderId: data.order_id,
-                    paymentId: data.payment_id || 'CONFIRMED',
-                    plan: matchedPlan,
-                    tier: tier,
-                    donationAmount: 0,
-                    retrievedKey: data.key || null
-                };
+        // Priority 1: Check /api/payment/my-purchases for complete purchase history and keys
+        let orderData = null;
+        try {
+            const res = await fetch(resolveApiUrl(`/api/payment/my-purchases?user_email=${encodeURIComponent(userEmail)}`), { headers });
+            if (res.ok) {
+                const data = await res.json();
+                if (data && data.success && data.has_license) {
+                    orderData = data.active_license || data;
+                    if (data.keys && data.keys.length > 0 && !orderData.key) {
+                        orderData.key = data.keys[0].key || data.keys[0].product_key;
+                    }
+                }
+            }
+        } catch (purchasesErr) {
+            console.warn("[PrivCloud] /api/payment/my-purchases notice:", purchasesErr);
+        }
 
-                try {
-                    sessionStorage.setItem(userStorageKey, JSON.stringify(verifiedOrderSession));
-                } catch (storeErr) {}
-
-                onPaymentSuccess(matchedPlan, data.order_id, data.payment_id || 'CONFIRMED', 0);
+        // Priority 2: Fallback to /api/payment/my-license
+        if (!orderData) {
+            try {
+                const res = await fetch(resolveApiUrl(`/api/payment/my-license?user_email=${encodeURIComponent(userEmail)}`), { headers });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.success && data.has_license && data.order_id) {
+                        orderData = data;
+                    }
+                }
+            } catch (licenseErr) {
+                console.warn("[PrivCloud] /api/payment/my-license notice:", licenseErr);
             }
         }
-    } catch (apiErr) {
-        console.warn("[PrivCloud] /api/payment/my-license notice:", apiErr);
+
+        if (orderData && orderData.order_id) {
+            const tier = (orderData.tier || 'TRIAL').toUpperCase();
+            const planId = (tier === 'PRO') ? '6b2f8c1a9d4e07bf' : ((tier === 'BASIC') ? '4d9e1a7b0c3f8e2a' : '9a8f10e7b9c2d4a6');
+            const matchedPlan = PLANS_DATA[planId] || PLANS_DATA['9a8f10e7b9c2d4a6'];
+
+            verifiedOrderSession = {
+                userEmail: userEmail,
+                orderId: orderData.order_id,
+                paymentId: orderData.payment_id || orderData.transaction_id || 'CONFIRMED',
+                plan: matchedPlan,
+                tier: tier,
+                donationAmount: 0,
+                retrievedKey: orderData.key || null,
+                purchaseDate: orderData.purchase_date,
+                paymentStatus: orderData.payment_status || 'verified',
+                amount: orderData.amount,
+                currency: orderData.currency || 'INR'
+            };
+
+            try {
+                sessionStorage.setItem(userStorageKey, JSON.stringify(verifiedOrderSession));
+            } catch (storeErr) {}
+
+            onPaymentSuccess(
+                matchedPlan,
+                orderData.order_id,
+                orderData.payment_id || orderData.transaction_id || 'CONFIRMED',
+                0,
+                {
+                    key: orderData.key || null,
+                    purchaseDate: orderData.purchase_date,
+                    paymentStatus: orderData.payment_status || 'verified',
+                    amount: orderData.amount,
+                    currency: orderData.currency || 'INR'
+                }
+            );
+            return;
+        }
+    } catch (dbErr) {
+        console.warn("[PrivCloud] Database purchase restore error:", dbErr);
+    }
+
+    // 3. Fallback: If network offline, check user-scoped sessionStorage
+    try {
+        const saved = sessionStorage.getItem(userStorageKey);
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            if (parsed && parsed.orderId && parsed.plan && (parsed.userEmail || '').toLowerCase() === userEmail) {
+                verifiedOrderSession = parsed;
+                onPaymentSuccess(
+                    parsed.plan,
+                    parsed.orderId,
+                    parsed.paymentId,
+                    parsed.donationAmount || 0,
+                    {
+                        key: parsed.retrievedKey,
+                        purchaseDate: parsed.purchaseDate,
+                        paymentStatus: parsed.paymentStatus,
+                        amount: parsed.amount,
+                        currency: parsed.currency
+                    }
+                );
+            }
+        }
+    } catch (e) {
+        console.warn("[PrivCloud] Session restore error:", e);
     }
 }
 
