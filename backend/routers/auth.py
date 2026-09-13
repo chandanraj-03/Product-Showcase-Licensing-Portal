@@ -5,7 +5,7 @@ username uniqueness verification, dual-identifier resolution (email or username)
 user profile registration, OTP verification state updates, and secure password reset.
 """
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from backend.config import (
     SUPABASE_URL,
@@ -37,7 +37,8 @@ from backend.users_db import (
     generate_username_suggestions,
     update_user_password_admin,
     validate_and_consume_reset_token,
-    verify_supabase_user_token
+    verify_supabase_user_token,
+    trigger_supabase_account_ready
 )
 
 router = APIRouter(prefix="/api", tags=["Authentication & Config"])
@@ -191,7 +192,7 @@ async def register_profile(payload: RegisterProfileRequest):
     }
 
 @router.post("/auth/verify-profile", summary="Mark Profile as Verified")
-async def verify_profile(payload: VerifyProfileRequest):
+async def verify_profile(payload: VerifyProfileRequest, background_tasks: BackgroundTasks):
     """
     Mark the user's registered profile as verified after successful OTP verification.
     """
@@ -199,6 +200,8 @@ async def verify_profile(payload: VerifyProfileRequest):
     username = payload.username.strip() if payload.username else None
     
     updated = await mark_user_verified(email=email, username=username)
+    if updated and email:
+        background_tasks.add_task(trigger_supabase_account_ready, email, username)
     return {
         'success': updated,
         'message': 'Profile verification status updated.' if updated else 'Profile not found.'
@@ -233,7 +236,7 @@ async def forgot_password(payload: ForgotPasswordRequest):
     }
 
 @router.post("/auth/verify-otp", summary="Verify OTP Code")
-async def verify_otp_endpoint(payload: VerifyOtpRequest):
+async def verify_otp_endpoint(payload: VerifyOtpRequest, background_tasks: BackgroundTasks):
     """
     Verify user 6-digit confirmation code.
     If verifying for password reset/recovery, generates a secure single-use reset token (S-2).
@@ -255,6 +258,9 @@ async def verify_otp_endpoint(payload: VerifyOtpRequest):
     }
     if reset_token:
         result['reset_token'] = reset_token
+
+    if otp_type == "signup":
+        background_tasks.add_task(trigger_supabase_account_ready, email)
 
     return result
 

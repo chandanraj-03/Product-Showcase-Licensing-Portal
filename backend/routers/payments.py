@@ -21,13 +21,14 @@ from backend.supabase_db import (
     save_verified_order,
     get_order,
     get_user_active_order,
+    get_user_all_purchases,
     assign_product_key,
     resolve_tier
 )
 
 router = APIRouter(prefix="/api", tags=["Payments"])
 
-async def _execute_post_payment_emails(user_email: str, resolved_username: str, payment_details: dict):
+async def _execute_post_payment_emails(user_email: str, resolved_username: str, payment_details: dict, bearer_token: Optional[str] = None):
     """Execute plan tier sync and payment confirmation receipt in background without blocking payment confirmation."""
     try:
         from backend.users_db import update_user_plan_tier
@@ -38,7 +39,7 @@ async def _execute_post_payment_emails(user_email: str, resolved_username: str, 
 
     try:
         from backend.users_db import trigger_supabase_reauthentication
-        trigger_supabase_reauthentication(email=user_email, payment_details=payment_details)
+        trigger_supabase_reauthentication(email=user_email, payment_details=payment_details, bearer_token=bearer_token)
     except Exception as e:
         print(f"[PostPayment Background] Receipt notice: {e}")
 
@@ -155,11 +156,11 @@ async def create_order(payload: CreateOrderRequest):
     )
 
 @router.post("/verify-payment", summary="Verify Razorpay Payment")
-async def verify_payment(payload: VerifyPaymentRequest, background_tasks: BackgroundTasks):
+async def verify_payment(payload: VerifyPaymentRequest, background_tasks: BackgroundTasks, request: Request):
     """
     Verify Razorpay Payment Signature.
     Expects JSON: { "razorpay_order_id": "...", "razorpay_payment_id": "...", "razorpay_signature": "..." }
-    Returns JSON: { "success": true, "message": "...", "order_id": "...", "payment_id": "..." }
+    Returns JSON: { "success": true, "message": "...", "order_id": "...", "payment_id": "...", "key": "..." }
     """
     if not RAZORPAY_KEY_SECRET:
         return JSONResponse(
@@ -255,6 +256,20 @@ async def verify_payment(payload: VerifyPaymentRequest, background_tasks: Backgr
             else:
                 amount_rupees = 0
 
+        # Atomically assign product key immediately upon payment verification
+        assigned_key = None
+        try:
+            success_k, k_res = assign_product_key(
+                tier=tier,
+                user_email=user_email,
+                order_id=razorpay_order_id,
+                payment_id=razorpay_payment_id
+            )
+            if success_k and k_res.get("key"):
+                assigned_key = k_res.get("key")
+        except Exception as k_err:
+            print(f"[Razorpay] Notice assigning key during verification: {k_err}")
+
         save_verified_order(
             order_id=razorpay_order_id,
             payment_id=razorpay_payment_id,
@@ -262,7 +277,8 @@ async def verify_payment(payload: VerifyPaymentRequest, background_tasks: Backgr
             plan_id=payload.plan_id or notes.get("plan_id", ""),
             tier=tier,
             amount=int(amount_rupees),
-            notes=notes
+            notes=notes,
+            key=assigned_key
         )
 
         # Trigger Post-Payment Plan Tier Sync and Confirmation Receipt
@@ -317,12 +333,17 @@ async def verify_payment(payload: VerifyPaymentRequest, background_tasks: Backgr
                     "user_email": user_email
                 }
 
+                # Extract Bearer token if provided by client in Authorization header
+                auth_hdr = request.headers.get("Authorization", "")
+                bearer_tok = auth_hdr.split("Bearer ")[-1].strip() if "Bearer " in auth_hdr else None
+
                 # Execute in background thread so the HTTP response returns instantly (in <50ms) to the user!
                 background_tasks.add_task(
                     _execute_post_payment_emails,
                     user_email,
                     resolved_username,
-                    payment_details
+                    payment_details,
+                    bearer_tok
                 )
             except Exception as email_err:
                 print(f"[Razorpay] Notice scheduling post-payment Supabase email triggers: {email_err}")
@@ -332,7 +353,8 @@ async def verify_payment(payload: VerifyPaymentRequest, background_tasks: Backgr
             'message': 'Payment verified successfully.',
             'order_id': razorpay_order_id,
             'payment_id': razorpay_payment_id,
-            'tier': tier
+            'tier': tier,
+            'key': assigned_key
         }
 
     except Exception as e:
@@ -371,11 +393,26 @@ async def create_trial_order(payload: Dict[str, Any]):
             "order_id": existing_order.get("order_id"),
             "payment_id": existing_order.get("payment_id", "FREE_TRIAL"),
             "tier": existing_order.get("tier", target_tier),
+            "key": existing_order.get("key"),
             "message": "Existing order retrieved."
         }
 
     trial_order_id = f"ord_{target_tier.lower()}_{uuid.uuid4().hex[:10]}"
     trial_payment_id = f"pay_{target_tier.lower()}_{uuid.uuid4().hex[:8]}"
+
+    # Atomically assign product key immediately upon activation
+    assigned_key = None
+    try:
+        success_k, k_res = assign_product_key(
+            tier=target_tier,
+            user_email=user_email,
+            order_id=trial_order_id,
+            payment_id=trial_payment_id
+        )
+        if success_k and k_res.get("key"):
+            assigned_key = k_res.get("key")
+    except Exception as k_err:
+        print(f"[Trial] Notice assigning key: {k_err}")
 
     save_verified_order(
         order_id=trial_order_id,
@@ -384,7 +421,8 @@ async def create_trial_order(payload: Dict[str, Any]):
         plan_id=plan_id,
         tier=target_tier,
         amount=199 if target_tier == "PRO" else (49 if target_tier == "BASIC" else 0),
-        notes={"source": "activation", "tier": target_tier}
+        notes={"source": "activation", "tier": target_tier},
+        key=assigned_key
     )
 
     return {
@@ -392,6 +430,7 @@ async def create_trial_order(payload: Dict[str, Any]):
         "order_id": trial_order_id,
         "payment_id": trial_payment_id,
         "tier": target_tier,
+        "key": assigned_key,
         "message": f"{target_tier.title()} order activated successfully."
     }
 
@@ -570,10 +609,49 @@ async def get_my_license(user_email: str, request: Request):
         'success': True,
         'has_license': True,
         'order_id': order.get("order_id"),
-        'payment_id': order.get("payment_id"),
+        'payment_id': order.get("payment_id") or order.get("transaction_id"),
+        'transaction_id': order.get("transaction_id") or order.get("payment_id"),
         'tier': order.get("tier"),
         'plan_id': order.get("plan_id"),
         'key': key,
+        'amount': order.get("amount", 0),
+        'currency': order.get("currency", "INR"),
+        'purchase_date': order.get("purchase_date") or order.get("verified_at") or order.get("assigned_at") or order.get("transaction_done_on") or order.get("created_at"),
+        'payment_status': order.get("status", "verified"),
+        'billing_period': "Lifetime License (1 PC)" if (order.get("tier") or "").upper() != "TRIAL" else "14-Day Evaluation",
         'assigned_at': str(order.get("assigned_at")) if order.get("assigned_at") else None
     }
+
+
+@router.get("/payment/my-purchases", summary="Get Authenticated User Purchase History and Keys")
+async def get_my_purchases(user_email: str, request: Request):
+    """
+    Retrieve all purchases, transactions, product keys, and active license for the authenticated user.
+    Strictly isolated per authenticated user email.
+    """
+    clean_email = (user_email or "").strip().lower()
+    if not clean_email:
+        return JSONResponse(
+            status_code=400,
+            content={'success': False, 'message': 'user_email parameter is required.'}
+        )
+
+    # If Authorization header is provided, verify ownership of email
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header and "Bearer " in auth_header:
+        bearer_token = auth_header.split("Bearer ")[-1].strip()
+        from backend.users_db import verify_supabase_user_token
+        is_owner = await verify_supabase_user_token(bearer_token, clean_email)
+        if not is_owner:
+            return JSONResponse(
+                status_code=403,
+                content={'success': False, 'message': 'Access denied: Token does not match requested email.'}
+            )
+
+    purchases_data = get_user_all_purchases(clean_email)
+    return {
+        'success': True,
+        **purchases_data
+    }
+
 
